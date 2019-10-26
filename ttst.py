@@ -1,42 +1,10 @@
 import socket
 import threading
 import json
-import time
+import os
+import argparse
 
-recieved_messages = []
-
-class SafeQueue:
-    """ Class wraps a list with a mutex to prevent race conditions """
-    def __init__(self, mutex):
-        """ Simple constructor creates the queue and assigns the mutex """
-        self.mutex = threading.Lock()
-        self.wait_lock = threading.Lock()
-        self.wait_lock.aquire()
-        self.queue = []
-
-    def wait_queue(self):
-        self.wait_lock.acquire()
-        self.wait_lock.release()
-
-    def push(self, item):
-        """ push an item onto the queue"""
-        self.mutex.acquire()
-        self.queue.append(item)
-        self.wait_lock.release()
-        self.mutex.release()
-
-    def dequeue(self):
-        """
-        Protected de-queue, cannot dequeue or queue at the same time
-        """
-        self.mutex.acquire()
-        if len(self.queue) == 1: # If De-queueing results in an empty queue, lock the mutex
-            self.wait_lock.acquire()
-        value = self.queue.pop(0)
-        self.mutex.release()
-        return value
-
-class Server:
+class RxServer:
     """
     TableTop simulator will respond to messages by attempting to send a JSON
     string over port 39998 using basic TCP.
@@ -51,7 +19,10 @@ class Server:
         self.s.bind(('localhost', 39998))
         self.s.listen(1)
         self.running = True
-        self.messages = SafeQueue()
+        self.messages = list()
+        self.wait_message = threading.Lock()
+        self.wait_message.acquire()
+        self.server_thread = threading.Thread(target=self.listen_loop)
 
     def __del__(self):
         self.stop()
@@ -61,10 +32,11 @@ class Server:
         Stop the server by exiting the listen loop and
         closing the server socket
         """
-        self.running = False
         self.s.close()
+        self.running = False
+        self.server_thread.join()
 
-    def start(self):
+    def listen_loop(self):
         """
         Start the listen loop
         Will block until self.stop() is called so this should be run
@@ -77,10 +49,23 @@ class Server:
             # but it could be used for logging
             conn, addr = self.s.accept()
             try:
-                data = recieve_data(conn)
+                data = self.recieve_data(conn)
             finally:
                 conn.close()
-            self.messages.push(json.loads(data))
+            self.messages.append(json.loads(data))
+            self.wait_message.release()
+
+    def start(self):
+        self.server_thread.start()
+
+    def pop_message(self):
+        """
+        Blocks until a message is available and returns the first item
+        """
+        self.wait_message.acquire()
+        self.wait_message.release()
+        message = self.messages.pop(0)
+        return message
 
     def recieve_data(self, socket_connection):
         """
@@ -94,7 +79,6 @@ class Server:
             data += b
         return data
             
-
 def push_message(message):
     """ 
     Push a message to the table top simulator instance
@@ -104,22 +88,60 @@ def push_message(message):
     host = 'localhost'
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.connect((host, port))
-    except ConnectionRefusedError:
-        print("Could not connect to talbe top simulator on port" + str(port))
-        print("Is table top simulator running?")
-        exit(1)
+    s.connect((host, port))
+
     try:
         s.sendall(message.encode())
     finally:
         s.close()
 
-server = Server()
-t = threading.Thread(target=server.start)
-t.start()
+def collect_local_lua_scripts():
+    """ Get all lua files in the cwd """
+    cwd = os.getcwd()
+    files = []
+    for f in os.listdir(cwd):
+        if os.path.isfile(os.path.join(cwd, f)) and f.split('.')[-1] == 'lua':
+            files.append(f)
+    return files
 
-push_message(json.dumps({"messageID": 0}))
+def build_push_json(files):
+    json_array = []
+    for f in files:
+        json_array.append({
+            'name': '.'.join(f.split('.')[0:-1])
+        })
+    return json_array
 
+def get_scripts():
+    try:
+        push_message(json.dumps({"messageID": 0}))
+    except ConnectionRefusedError:
+        print("Unable to connect to instance of table top simulator, is it running?")
+        os._exit(1)
 
-#server.stop()
+    response = server.pop_message()
+
+    for script in response['scriptStates']:
+        with open(script['name'] + ".lua", "w") as f:
+            f.write(script['script'])
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Table Top Simulator code tool")
+    parser.add_argument('action')
+    args = parser.parse_args()
+
+    if args.action == 'get':
+        server = RxServer()
+        server.start()
+        get_scripts()
+        os._exit(0)
+    elif args.action == 'push':
+        # TODO
+        print('push code to TableTop simulator instance')
+        files = collect_local_lua_scripts()
+        json = build_push_json(files)
+        print(json)
+    elif args.action == 'listen':
+        server = RxServer()
+        server.start()
+        print(server.pop_message())
